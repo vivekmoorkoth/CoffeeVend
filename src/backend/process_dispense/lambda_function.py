@@ -74,38 +74,29 @@ def reject(error, error_type, purchase=None, machine_id=None):
 def get_dispense_job(event):
   params = event.get("queryStringParameters") or {}
   machine_id = params.get("machine_id") or MACHINE_ID
-  if not re.match(r"^[A-Za-z0-9_-]{1,64}$", machine_id):
-      return {"statusCode": 400, "body": json.dumps({"error": "machine_id is invalid"})}
+  component = params.get("component")
+  if component not in ("cup", "pod"):
+    return {"statusCode": 400, "body": json.dumps({"error": "component must be cup or pod"})}
+  col = f"{component}_job_status"
+  now = datetime.now(timezone.utc).isoformat()
 
-
-
-
-  # find the oldest Authorized job for this machine
-  jobs = supabase_request(f"{EVENTS_TABLE}?machine_id=eq.{machine_id}&dispense_status=eq.Authorized&order=id.asc&limit=1&select=*")
+  jobs = supabase_request(f"{EVENTS_TABLE}?machine_id=eq.{machine_id}&{col}=eq.Authorized&order=id.asc&limit=1&select=*")
   if not jobs:
-      return {"statusCode": 200, "body": json.dumps({"job_available": False})}
+    return {"statusCode": 200, "body": json.dumps({"job_available": False})}
   job = jobs[0]
 
-
-
-
-  # claim it: Authorized -> Dispensing (only succeeds if it is still Authorized)
-  claimed = supabase_request(
-      f"{EVENTS_TABLE}?id=eq.{job['id']}&dispense_status=eq.Authorized", "PATCH",
-      {"dispense_status": "Dispensing", "started_at": datetime.now(timezone.utc).isoformat()}
-  )
+  claimed = supabase_request(f"{EVENTS_TABLE}?id=eq.{job['id']}&{col}=eq.Authorized", "PATCH",
+    {col: "Dispensing", f"{component}_started_at": now})
   if not claimed:
-      return {"statusCode": 200, "body": json.dumps({"job_available": False})}
+    return {"statusCode": 200, "body": json.dumps({"job_available": False})}
+
+  if component == "cup":
+    supabase_request(f"{EVENTS_TABLE}?id=eq.{job['id']}&dispense_status=eq.Authorized", "PATCH",
+      {"dispense_status": "Dispensing", "started_at": now})
+
+  return {"statusCode": 200, "body": json.dumps({"job_available": True, "job_id": job["id"], "purchase_id": job["purchase_id"], "machine_id": machine_id, "component": component})}
 
 
-
-
-  return {"statusCode": 200, "body": json.dumps({
-      "job_available": True,
-      "job_id": job["id"],
-      "purchase_id": job["purchase_id"],
-      "machine_id": machine_id
-  })}
 @catch_errors
 def lambda_handler(event, context):
   if event.get("requestContext", {}).get("http", {}).get("method") == "GET":
@@ -177,9 +168,11 @@ def lambda_handler(event, context):
   # everything passed: create the DispenseEvents row
   dispense_event = create_dispense_event({
       "purchase_id": purchase["id"],
-      "machine_id": machine_id,
-      "dispense_status": "Authorized",                    
+      "machine_id": machine_id,                 
       "authorized_at": datetime.now(timezone.utc).isoformat(),
+      "dispense_status": "Authorized",
+      "cup_job_status": "Authorized",
+      "pod_job_status": "Authorized",
       "cup_attempts": 0,
       "pod_attempts": 0
   })
