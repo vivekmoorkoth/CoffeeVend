@@ -31,8 +31,7 @@ Clarify what is intentionally out of scope for this version of the project. This
 
 Provide a high-level view of how the system works. Include the main components, how they interact, and how data moves through the workflow. A Mermaid diagram is a good way to communicate this clearly.
 
-![System architecture](system-architecture.pdf)
-
+![System architecture](Design%20Doc.png)
 ## Data Sources
 
 Describe where the data comes from and how it will be used. Include:
