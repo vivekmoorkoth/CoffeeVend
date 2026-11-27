@@ -31,19 +31,7 @@ Clarify what is intentionally out of scope for this version of the project. This
 
 Provide a high-level view of how the system works. Include the main components, how they interact, and how data moves through the workflow. A Mermaid diagram is a good way to communicate this clearly.
 
-```mermaid
-flowchart LR
-    User[User or Stakeholder]
-    Data[(Data Sources)]
-    Pipeline[Data Processing / Modeling]
-    Results[Outputs / Insights / Predictions]
-    Config[Configuration and Secrets]
-
-    User --> Pipeline
-    Data --> Pipeline
-    Config --> Pipeline
-    Pipeline --> Results
-```
+![System architecture](system-architecture.pdf)
 
 ## Data Sources
 
