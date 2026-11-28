@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY")
-MACHINE_ID = os.environ["MACHINE_ID"]
+MACHINE_ID = os.environ.get("MACHINE_ID", "coffeevend_01")
 
-#formats response from lambda function
+#functions for response and requesting from supabase
 def response(status, body):
     return {
         "statusCode": status,
@@ -17,7 +17,7 @@ def response(status, body):
         "body": json.dumps(body),
     }
 
-#creates function to request information from supabase
+
 def supabase_request(path, method="GET", data=None):
     req = urllib.request.Request(
         f"{SUPABASE_URL}/rest/v1/{path}",
@@ -25,110 +25,317 @@ def supabase_request(path, method="GET", data=None):
         method=method,
         headers={
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
-            "Prefer": "return=representation"
+            "Prefer": "return=representation",
         },
     )
+
     try:
-      with urllib.request.urlopen(req, timeout=5) as response:
-          raw = response.read().decode()
-          return json.loads(raw) if raw else []
+        with urllib.request.urlopen(req, timeout=10) as res:
+            raw = res.read().decode()
+            return json.loads(raw) if raw else []
+
     except urllib.error.HTTPError as e:
-        print("Supabase said:", e.code, e.read().decode())
+        error_body = e.read().decode()
+        print("Supabase said:", e.code, error_body)
         raise
-    #e.code is an HTTP status number, e.read() returns response body as raw bytes [explains error], .decode decodes byte into normal string
-    #error checking
+
 
 def lambda_handler(event, context):
     try:
-        #gets params [necessary info] from the event
-        params = event.get("queryStringParameters") or {}
-        if not params:
-            body = event.get('body')
-            if isinstance(body, str) and body:
-                params = json.loads(body)
-            elif isinstance(body, dict):
-                params = body
-            else:
-                params = event
+        #parsing json input and getting necessary parameters
 
-        job_id = params.get('job_id')
+        body = event.get("body")
+
+        if isinstance(body, str) and body:
+            params = json.loads(body)
+        elif isinstance(body, dict):
+            params = body
+        else:
+            params = event
+
+        print("RESULT BODY:", params)
+
+        job_id = params.get("job_id")
+        component = params.get("component")
+        status = params.get("status")
+        attempts = params.get("attempts")
+        reported_error = params.get("error_type")
+
+        #checking that all variables are valid
         if job_id is None:
             return response(400, {"error": "job_id required"})
 
-        events = supabase_request(f"DispenseEvents?id=eq.{job_id}&select=purchase_id")
+        if component not in ("cup", "pod"):
+            return response(400, {"error": "component must be 'cup' or 'pod'"})
+
+        if status not in ("success", "failed"):
+            return response(400, {"error": "status must be 'success' or 'failed'"})
+
+        if not isinstance(attempts, int) or attempts < 1 or attempts > 2:
+            return response(400, {"error": f"{component} attempts must be 1 or 2"})
+
+        if status == "success" and reported_error is not None:
+            return response(
+                400,
+                {"error": "error_type must be null when status is success"}
+            )
+
+        if status == "failed" and reported_error not in (
+            "dispense_failed",
+            "sensor_failure",
+            "motor_failure",
+            "timeout"
+        ):
+            return response(
+                400,
+                {"error": "invalid error_type for failed dispense"}
+            )
+
+        #getting DispenseEvents table and all necessary columns
+        events = supabase_request(
+            f"DispenseEvents"
+            f"?id=eq.{job_id}"
+            f"&select=id,purchase_id,machine_id,dispense_status,"
+            f"cup_status,pod_status,"
+            f"cup_job_status,pod_job_status,"
+            f"cup_attempts,pod_attempts"
+        )
+
+        #checking events is valid
         if not events:
-            return response(404, {"error": f"unknown job_id {job_id}"})
-        purchase_id = events[0]["purchase_id"]
+            return response(
+                404,
+                {"error": f"unknown job_id {job_id}"}
+            )
 
-        cup_status = params.get("cup_status")
-        pod_status = params.get("pod_status")
+        #row is first row in DispenseEvents that has an id that matches job_id
+        row = events[0]
 
-        #checks that cup and pod status exists
-        if cup_status is None and pod_status is None:
-            return response(400, {"error": "cup_status or pod_status required"})
+        #getting purchase and machine id; making sure machine_id is whatever's in the supabase or the env variable 
+        purchase_id = row["purchase_id"]
+        machine_id = row.get("machine_id") or MACHINE_ID
 
-        #checks if cup and pod dispense was successful
-        cup_ok = cup_status == "success"
-        pod_ok = pod_status == "success"
-        both_ok = cup_ok and pod_ok
+        component_job_column = f"{component}_job_status"
+
+        print("CURRENT EVENT:", row)
+        print("COMPONENT JOB STATE:", row.get(component_job_column))
+
+        #preventing duplicate purchase
+        current_component_job_status = row.get(component_job_column)
+
+        #making sure that if current job status is either completed or failed, it just immediately sends a failed response with current dispense status
+        if current_component_job_status in ("Completed", "Failed"):
+            return response(
+                200,
+                {
+                    "recorded": False,
+                    "dispense_status": row.get("dispense_status"),
+                },
+            )
+
+        #if status is not currently dispensing, makes sure that it returns an error because it should be dispensing while both components are dispensing
+        if current_component_job_status != "Dispensing":
+            return response(
+                409,
+                {
+                    "recorded": False,
+                    "error": f"{component} component is not currently dispensing",
+                    "component_job_status": current_component_job_status,
+                },
+            )
+
         now = datetime.now(timezone.utc).isoformat()
+
+        # -----------------------------------
+        # 5. Finalize THIS component
+        # -----------------------------------
+
+        component_final_job_status = (
+            "Completed" if status == "success" else "Failed"
+        )
+
+        update = {
+            f"{component}_status": status,
+            f"{component}_attempts": attempts,
+            f"{component}_job_status": component_final_job_status,
+            "updated_at": now,
+        }
+
+        if status == "failed":
+            update["error_type"] = reported_error
+
+        print("COMPONENT UPDATE:", update)
+
+        supabase_request(
+            f"DispenseEvents?id=eq.{job_id}",
+            method="PATCH",
+            data=update,
+        )
+
+        # -----------------------------------
+        # 6. Update inventory if physical dispense succeeded
+        # -----------------------------------
+
+        if status == "success":
+            encoded_machine_id = urllib.parse.quote(machine_id, safe="")
+
+            if component == "cup":
+                inventory_column = "cups_remaining"
+            else:
+                inventory_column = "pods_remaining"
+
+            inventory_rows = supabase_request(
+                f"CoffeeInventory"
+                f"?machine_id=eq.{encoded_machine_id}"
+                f"&select={inventory_column}"
+            )
+
+            if not inventory_rows:
+                return response(
+                    404,
+                    {"error": f"unknown machine_id {machine_id}"}
+                )
+
+            current_count = inventory_rows[0][inventory_column]
+
+            print(
+                "INVENTORY:",
+                inventory_column,
+                current_count,
+                "->",
+                max(0, current_count - 1),
+            )
+
+            supabase_request(
+                f"CoffeeInventory?machine_id=eq.{encoded_machine_id}",
+                method="PATCH",
+                data={
+                    inventory_column: max(0, current_count - 1),
+                    "updated_at": now,
+                },
+            )
+
+        # -----------------------------------
+        # 7. Re-read event after component update
+        # -----------------------------------
+
+        updated_events = supabase_request(
+            f"DispenseEvents"
+            f"?id=eq.{job_id}"
+            f"&select=cup_status,pod_status,"
+            f"cup_job_status,pod_job_status,dispense_status"
+        )
+
+        updated = updated_events[0]
+
+        cup_job_status = updated.get("cup_job_status")
+        pod_job_status = updated.get("pod_job_status")
+
+        cup_status = updated.get("cup_status")
+        pod_status = updated.get("pod_status")
+
+        print("AFTER COMPONENT RESULT:", updated)
+
+        # -----------------------------------
+        # 8. If one component is still working, overall remains Dispensing
+        # -----------------------------------
+
+        cup_finished = cup_job_status in ("Completed", "Failed")
+        pod_finished = pod_job_status in ("Completed", "Failed")
+
+        if not (cup_finished and pod_finished):
+            return response(
+                200,
+                {
+                    "recorded": True,
+                    "dispense_status": "Dispensing",
+                },
+            )
+
+        # -----------------------------------
+        # 9. Both components have reported
+        # -----------------------------------
+
+        both_ok = (
+            cup_job_status == "Completed"
+            and pod_job_status == "Completed"
+            and cup_status == "success"
+            and pod_status == "success"
+        )
+
+        both_failed = (
+            cup_job_status == "Failed"
+            and pod_job_status == "Failed"
+        )
+
+        if both_ok:
+            overall_status = "Completed"
+            error_type = None
+
+        elif both_failed:
+            overall_status = "Failed"
+            error_type = "both_failed"
+
+        else:
+            overall_status = "Failed"
+            error_type = "partial_dispense"
+
+        # -----------------------------------
+        # 10. Finalize overall DispenseEvents row
+        # -----------------------------------
 
         supabase_request(
             f"DispenseEvents?id=eq.{job_id}",
             method="PATCH",
             data={
-                "cup_status": cup_status if cup_ok else "failed",
-                "pod_status": pod_status if pod_ok else "failed",
-                "dispense_status": "Completed" if both_ok else "Failed",
+                "dispense_status": overall_status,
+                "error_type": error_type,
                 "completed_at": now,
-                "error_type": "partial_dispense" if not both_ok else ""
+                "updated_at": now,
             },
         )
 
-        supabase_request(
-            f"Purchases?id=eq.{purchase_id}",
-            method="PATCH",
-            data={
-                "status": "Delivered" if both_ok else "Failed"
+        # -----------------------------------
+        # 11. Mark purchase Delivered only if BOTH succeeded
+        # -----------------------------------
+
+        if both_ok:
+            supabase_request(
+                f"Purchases?id=eq.{purchase_id}",
+                method="PATCH",
+                data={
+                    "status": "Delivered"
+                },
+            )
+
+        return response(
+            200,
+            {
+                "recorded": True,
+                "dispense_status": overall_status,
             },
         )
 
-        #makes machine id safe to put in url
-        mid = urllib.parse.quote(MACHINE_ID, safe="")
-
-        #goes through inventory and checks that the machine id of the inventory is the same as the machine id we have stored 
-        #then selects cups_remaining and pods_remaining columsn instead of the whole row
-        rows = supabase_request(
-            f"CoffeeInventory?machine_id=eq.{mid}&select=cups_remaining,pods_remaining"
-        )
-        #if no rows match it means that the machine id doesn't exist and returns error response
-        if not rows:
-            return response(404, {"error": f"unknown machine_id {MACHINE_ID}"})
-        #else take the first row from rows created database
-        row = rows[0]
-
-        #edit the first row; make sure cups and pods remaining are above 0 always
-        #if cup and pod are dispensed, decrement by 1 else decrement by 0
-        supabase_request(
-            f"CoffeeInventory?machine_id=eq.{mid}",
-            method="PATCH",
-            data={
-                "cups_remaining": max(0, row["cups_remaining"] - (1 if cup_ok else 0)),
-                "pods_remaining": max(0, row["pods_remaining"] - (1 if pod_ok else 0)),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-        return response(200, {"recorded": True, "dispense_status": "Completed" if both_ok else "Failed"})
-    
-    #error handling
     except json.JSONDecodeError:
         return response(400, {"error": "invalid JSON body"})
+
     except urllib.error.HTTPError as e:
-        print(f"Supabase HTTP {e.code}")
-        return response(500, {"recorded": False, "dispense_status": "Failed"})
+        print(f"Supabase HTTP error: {e.code}")
+        return response(
+            500,
+            {
+                "recorded": False,
+                "error": "Supabase request failed",
+            },
+        )
+
     except Exception as e:
         print(f"Error: {type(e).__name__}: {e}")
-        return response(500, {"recorded": False, "dispense_status": "Failed"})
+        return response(
+            500,
+            {
+                "recorded": False,
+                "error": "Internal server error",
+            },
+        )
